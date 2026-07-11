@@ -208,6 +208,7 @@
       <span style="font-size:14px;color:var(--muted);">⟳</span>
     </div>
   </div>
+  <div id="syncStatus" style="display:none;margin-top:10px;font-size:11.5px;color:var(--amber);background:rgba(232,162,61,.12);border:1px solid rgba(232,162,61,.3);border-radius:8px;padding:7px 10px;"></div>
 </div>
 
 <div class="tabs" id="tabs">
@@ -496,28 +497,113 @@ const firebaseConfig = {
   messagingSenderId: "1021916608018",
   appId: "1:1021916608018:web:9324b7511d14c8837e0acb"
 };
-firebase.initializeApp(firebaseConfig);
-const dataRef = firebase.database().ref('trackerData');
+let fbAvailable = false;
+let dataRef = null;
+try{
+  if(typeof firebase !== 'undefined'){
+    firebase.initializeApp(firebaseConfig);
+    dataRef = firebase.database().ref('trackerData');
+    fbAvailable = true;
+  } else {
+    console.error('Firebase SDK failed to load (offline?)');
+  }
+}catch(e){
+  console.error('Firebase init failed', e);
+}
 let firstLoad = true;
 let data = null;
+let hasRealData = false; // true once we've received an actual value from Firebase at least once
+const LOCAL_BACKUP_KEY = 'trackerData_backup_v1';
 let curMonth = new Date(); curMonth.setDate(1);
+
+function emptyData(){
+  return { names:['Phyo Phyo','Zin Min Htet'], work:[], expense:[], savings:[], debt:[] };
+}
+function normalizeData(val){
+  const d = val;
+  d.work = d.work || [];
+  d.expense = d.expense || [];
+  d.savings = d.savings || [];
+  d.debt = d.debt || [];
+  d.names = d.names || ['Phyo Phyo','Zin Min Htet'];
+  if(d.names[0]==='ကျွန်တော်' && d.names[1]==='ကျွန်မ'){
+    d.names = ['Phyo Phyo','Zin Min Htet'];
+  }
+  return d;
+}
+function loadLocalBackup(){
+  try{
+    const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
+    if(raw) return normalizeData(JSON.parse(raw));
+  }catch(e){ console.error('backup read failed', e); }
+  return null;
+}
+function saveLocalBackup(){
+  try{ localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(data)); }catch(e){ console.error('backup write failed', e); }
+}
+const PENDING_KEY = 'trackerData_pending_v1';
+let pendingSync = false;
+try{ pendingSync = localStorage.getItem(PENDING_KEY) === '1'; }catch(e){}
+function markPending(v){
+  pendingSync = v;
+  try{ localStorage.setItem(PENDING_KEY, v ? '1' : '0'); }catch(e){}
+}
+function pushToServer(){
+  if(!fbAvailable || !dataRef || !data) return Promise.resolve(false);
+  return dataRef.set(data).then(()=>{ markPending(false); setSyncStatus('ok'); return true; })
+    .catch(e=>{ console.error(e); setSyncStatus('offline'); return false; });
+}
+function setSyncStatus(state){
+  // state: 'ok' | 'error' | 'offline' | 'local'
+  const el = document.getElementById('syncStatus');
+  if(!el) return;
+  if(state==='ok'){ el.style.display='none'; return; }
+  el.style.display='block';
+  if(state==='local'){
+    el.textContent = '⚠ Server နဲ့ ချိတ်ဆက်၍မရပါ (အင်တာနက် စစ်ပါ) — ဒီစက်ထဲက data ကိုပဲ ကြည့်/ထည့်နေပါတယ်၊ ချိတ်ဆက်ပြီးရင် refresh လုပ်ပါ';
+    return;
+  }
+  el.textContent = state==='offline'
+    ? '⚠ အင်တာနက် မချိတ်ဆက်နိုင်ပါ — နောက်ဆုံး သိမ်းထားတဲ့ data ကို ပြထားပါတယ်'
+    : '⚠ Server နဲ့ ချိတ်ဆက်မှု ပြဿနာ — နောက်ဆုံး သိမ်းထားတဲ့ data ကို ပြထားပါတယ်';
+}
 
 function initRealtime(){
   return new Promise((resolve)=>{
+    // Show last-known data immediately so a refresh never looks empty while we wait on the network.
+    const backup = loadLocalBackup();
+    if(backup){
+      data = backup;
+      firstLoad = false;
+      resolve();
+    }
+
+    if(!fbAvailable){
+      // Firebase SDK never loaded (e.g. no internet when the page opened). Run local-only.
+      if(!data){ data = emptyData(); }
+      setSyncStatus('local');
+      if(firstLoad){ firstLoad = false; resolve(); }
+      return;
+    }
+
     dataRef.on('value', snap=>{
+      if(pendingSync){
+        // We have local edits that haven't been confirmed saved yet — push them
+        // instead of accepting a (possibly stale) server value that would erase them.
+        pushToServer();
+        if(firstLoad){ firstLoad = false; resolve(); }
+        return;
+      }
       const val = snap.val();
       if(val){
-        data = val;
-        data.work = data.work || [];
-        data.expense = data.expense || [];
-        data.savings = data.savings || [];
-        data.debt = data.debt || [];
-        data.names = data.names || ['Phyo Phyo','Zin Min Htet'];
-        if(data.names[0]==='ကျွန်တော်' && data.names[1]==='ကျွန်မ'){
-          data.names = ['Phyo Phyo','Zin Min Htet'];
-        }
-      } else {
-        data = { names:['Phyo Phyo','Zin Min Htet'], work:[], expense:[], savings:[], debt:[] };
+        data = normalizeData(val);
+        hasRealData = true;
+        saveLocalBackup();
+        setSyncStatus('ok');
+      } else if(!hasRealData){
+        // Genuinely empty database (real first-time use), not an error.
+        data = data || emptyData();
+        hasRealData = true;
       }
       if(firstLoad){
         firstLoad = false;
@@ -528,8 +614,10 @@ function initRealtime(){
       }
     }, err=>{
       console.error(err);
+      // Never overwrite good local/backup data with an empty structure on a read error.
+      if(!data){ data = emptyData(); }
+      setSyncStatus('error');
       if(firstLoad){
-        data = { names:['Phyo Phyo','Zin Min Htet'], work:[], expense:[], savings:[], debt:[] };
         firstLoad = false;
         resolve();
       }
@@ -537,14 +625,33 @@ function initRealtime(){
   });
 }
 async function saveData(){
-  try{ await dataRef.set(data); }catch(e){ console.error(e); alert('Sync မအောင်မြင်ပါ - internet စစ်ကြည့်ပါ'); }
+  saveLocalBackup();
+  markPending(true);
+  if(!fbAvailable){
+    setSyncStatus('local');
+    return;
+  }
+  try{
+    await dataRef.set(data);
+    markPending(false);
+    setSyncStatus('ok');
+  }catch(e){
+    console.error(e);
+    setSyncStatus('offline');
+    alert('Sync မအောင်မြင်ပါ - internet စစ်ကြည့်ပါ။ Data ကို ဒီစက်ထဲမှာ သိမ်းထားပါတယ်၊ ချိတ်ဆက်ပြီးရင် ပြန်ညှိပေးပါမယ်။');
+  }
 }
 async function refreshData(){
+  if(!fbAvailable){ location.reload(); return; }
   renderAll();
 }
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
-function todayStr(){ const d=new Date(); return d.toISOString().slice(0,10); }
+function todayStr(){
+  const d=new Date();
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), day=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
 function fmt(n){ return Math.round(n).toLocaleString(); }
 function myMonthLabel(d){
   const months=['ဇန်နဝါရီ','ဖေဖော်ဝါရီ','မတ်','ဧပြီ','မေ','ဇွန်','ဇူလိုင်','သြဂုတ်','စက်တင်ဘာ','အောက်တိုဘာ','နိုဝင်ဘာ','ဒီဇင်ဘာ'];
